@@ -868,6 +868,11 @@ def test_flow_unipc_reproducible_with_same_seed(make_cosmos3_pipeline) -> None:
     )
 
     pipeline = make_cosmos3_pipeline()
+    # ROCm PyTorch wheels don't have LAPACK for CPU, so we run the solver on GPU.
+    from vllm_omni.platforms import current_omni_platform
+
+    if torch.cuda.is_available() and current_omni_platform.is_rocm():
+        pipeline.device = torch.device("cuda")
     pipeline.scheduler = FlowUniPCMultistepScheduler(
         shift=1.0,
         use_dynamic_shifting=False,

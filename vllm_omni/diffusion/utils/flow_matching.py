@@ -3,8 +3,16 @@
 
 import math
 
+import numpy as np
 import torch
 from torch import nn
+
+
+def safe_linalg_solve(matrix: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
+    # ROCm PyTorch wheels are built without CPU LAPACK.
+    if matrix.device.type == "cpu" and not torch._C.has_lapack:
+        return torch.from_numpy(np.linalg.solve(matrix.numpy(), rhs.numpy()))
+    return torch.linalg.solve(matrix, rhs)
 
 
 def swish(x: torch.Tensor) -> torch.Tensor:

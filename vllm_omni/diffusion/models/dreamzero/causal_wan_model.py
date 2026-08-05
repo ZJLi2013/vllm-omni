@@ -85,15 +85,26 @@ def rope_params(max_seq_len: int, dim: int) -> torch.Tensor:
 def rope_apply(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
     """Apply RoPE to x, with ``freqs`` as a real ``(..., 2)`` cos/sin table.
 
-    The rotation is written out in real arithmetic rather than as a complex
-    multiply because inductor cannot generate code for complex operators: a
-    complex multiply here falls back to eager and, being opaque to the scheduler,
-    also splits the surrounding qk-norm and layout work into separate fusion
-    groups. The two real multiply-adds below are the same products in the same
-    order that ``torch.mul`` performs on complex operands.
+    Two forms of the same rotation, picked by whether inductor is generating code.
+
+    Compiled: inductor cannot generate code for complex operators, so a complex
+    multiply here falls back to eager, and being opaque to the scheduler it also
+    splits the surrounding qk-norm and layout work into separate fusion groups.
+    Written out in real arithmetic the whole segment fuses instead, measured on
+    gfx950 as three kernels collapsing to one.
+
+    Eager: the real form is the slower one by about 4x, because each of its
+    multiply-adds becomes its own pass over a float64 temporary while the complex
+    multiply is a single elementwise kernel.
+
+    Both branches evaluate the same products in the same order and agree bitwise
+    once the caller casts back to bfloat16.
     """
     B, seq_len, n, _ = x.shape
     pairs = x.to(torch.float64).reshape(B, seq_len, n, -1, 2)
+    if not torch.compiler.is_compiling():
+        rotated = torch.view_as_complex(pairs) * torch.view_as_complex(freqs).unsqueeze(0)
+        return torch.view_as_real(rotated).flatten(3)
     x_re, x_im = pairs[..., 0], pairs[..., 1]
     cos, sin = freqs[..., 0].unsqueeze(0), freqs[..., 1].unsqueeze(0)
     return torch.stack((x_re * cos - x_im * sin, x_re * sin + x_im * cos), dim=-1).flatten(3)

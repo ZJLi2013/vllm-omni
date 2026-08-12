@@ -54,10 +54,16 @@ def _reshape_and_cache_flash() -> Callable[..., Any] | None:
     — the cost is the generic indexing path, not the index count (a block-granular
     ``index_put_`` with 8 indices instead of 1760 measures the same).
 
-    aiter exposes an identically-signed ``reshape_and_cache_flash``, but it is the
-    slower of the two here (4.07 TB/s on gfx950) and, being ROCm-only, would need
-    this one as a fallback anyway. Resolved once per process, since the import is
-    not dynamo-traceable.
+    aiter exposes an identically-signed ``reshape_and_cache_flash`` -- the same
+    kernel, forked before vLLM vectorised the copy, so it still stores one 2-byte
+    element per thread per step and reaches 4.07 TB/s where this one's 16-byte
+    ``vectorize_with_alignment`` path reaches 5.10. Worth re-pricing once aiter
+    picks that up, though being ROCm-only it would need this as a fallback anyway.
+
+    That vectorised path is guarded on ``head_stride == head_size``, so the caller
+    must hand over the NHD cache view rather than a head-strided one; the
+    contiguity checks below keep us on it. Resolved once per process, since the
+    import is not dynamo-traceable.
     """
     try:
         from vllm._custom_ops import reshape_and_cache_flash

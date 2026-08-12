@@ -44,72 +44,84 @@ def set_current_packed_kv_index(
     _CURRENT_PACKED_KV_INDEX = (block_table, seq_lens, page, flat, cu_seqlens_k)
 
 
-try:
-    import triton
-    import triton.language as tl
+@cache
+def _reshape_and_cache_flash() -> Callable[..., Any] | None:
+    """The stock fused K+V paged-cache write, or ``None`` when unavailable.
 
-    @triton.jit
-    def _kv_slot_write_kernel(
-        k_pool,
-        v_pool,
-        k_src,
-        v_src,
-        slots,
-        row_numel,
-        BLOCK: tl.constexpr,
-    ):
-        """Write one K and one V row per program into their shared pool slot.
+    This is the op every vLLM attention backend stores KV with: one launch writes
+    one K and one V row per token into the slot they share. It replaces a pair of
+    ``index_put_`` calls, which run this shape at 1.47 TB/s where a contiguous copy
+    of the same bytes reaches 6.14 — the cost is the generic indexing path, not the
+    index count (a block-granular ``index_put_`` with 8 indices instead of 1760
+    measures the same).
 
-        ``aten::index_put_`` on this shape runs at 1.47 TB/s where a contiguous
-        copy of the same bytes reaches 6.14; the cost is the generic indexing
-        path, not the index count (a block-granular index_put with 8 indices
-        instead of 1760 measures the same). One program per row keeps every
-        load/store a fully coalesced 10 KiB run, and doing K and V together
-        halves the launches since they share the slot mapping.
-        """
-        row = tl.program_id(0)
-        chunk = tl.program_id(1)
-        slot = tl.load(slots + row)
-        offs = chunk * BLOCK + tl.arange(0, BLOCK)
-        mask = offs < row_numel
-        src_off = row * row_numel + offs
-        dst_off = slot * row_numel + offs
-        tl.store(k_pool + dst_off, tl.load(k_src + src_off, mask=mask), mask=mask)
-        tl.store(v_pool + dst_off, tl.load(v_src + src_off, mask=mask), mask=mask)
+    aiter first, since it is the tuned kernel on this platform and its
+    ``module_cache`` extension ships prebuilt (no first-call JIT); vLLM's own
+    ``_C_cache_ops`` entry has the identical signature and covers CUDA. Resolved
+    once per process: importing aiter shells out to ``rocminfo``, and neither
+    import is dynamo-traceable.
+    """
+    try:
+        from aiter.ops.cache import reshape_and_cache_flash
 
-except ImportError:  # pragma: no cover - triton ships with the ROCm/CUDA wheels
-    triton = None
+        return reshape_and_cache_flash
+    except Exception:
+        pass
+    try:
+        from vllm._custom_ops import reshape_and_cache_flash
+
+        return reshape_and_cache_flash
+    except Exception:
+        return None
 
 
-def _can_fuse_kv_write(k_pool, v_pool, k_src, v_src, slots) -> bool:
+_UNIT_SCALES: dict[torch.device, torch.Tensor] = {}
+
+
+def _unit_scale(device: torch.device) -> torch.Tensor:
+    # Unused under kv_cache_dtype="auto" (a straight copy), but the op still
+    # dereferences both scale pointers.
+    scale = _UNIT_SCALES.get(device)
+    if scale is None:
+        scale = torch.ones((), dtype=torch.float32, device=device)
+        _UNIT_SCALES[device] = scale
+    return scale
+
+
+def _can_use_cache_write_op(k_cache, v_cache, k_src, v_src, slots) -> bool:
     return (
-        triton is not None
-        and k_pool.is_cuda
-        and k_src.dtype == k_pool.dtype
-        and v_src.dtype == v_pool.dtype
+        k_cache.is_cuda
+        and k_src.dtype == k_cache.dtype
+        and v_src.dtype == v_cache.dtype
         and k_src.is_contiguous()
         and v_src.is_contiguous()
-        and k_pool.is_contiguous()
-        and v_pool.is_contiguous()
+        and k_cache.is_contiguous()
+        and v_cache.is_contiguous()
+        and slots.dtype == torch.int64
         and slots.numel() == k_src.shape[0]
     )
 
 
-def write_kv_slots(k_pool, v_pool, k_src, v_src, slots) -> None:
-    """Scatter ``k_src``/``v_src`` rows into the pools at ``slots``.
+def write_kv_slots(k_cache, v_cache, k_src, v_src, slots) -> None:
+    """Scatter ``k_src``/``v_src`` rows into the paged caches at ``slots``.
 
-    Falls back to the indexed write when triton is unavailable or the tensors
-    are not the plain contiguous same-dtype case the kernel assumes (CPU
+    ``k_cache``/``v_cache`` are ``(num_blocks, block_size, H, D)``; ``slots`` holds
+    one absolute slot (``block_id * block_size + offset``) per source row, which is
+    the layout and the indexing convention the stock op already expects.
+
+    Falls back to the indexed write on the flat views when no such op is available
+    or the tensors are not the plain contiguous same-dtype case it assumes (CPU
     reference path, dtype-converting writes).
     """
-    if not _can_fuse_kv_write(k_pool, v_pool, k_src, v_src, slots):
-        k_pool[slots] = k_src.to(k_pool.dtype)
-        v_pool[slots] = v_src.to(v_pool.dtype)
+    op = _reshape_and_cache_flash()
+    if op is not None and _can_use_cache_write_op(k_cache, v_cache, k_src, v_src, slots):
+        scale = _unit_scale(k_cache.device)
+        op(k_src, v_src, k_cache, v_cache, slots, "auto", scale, scale)
         return
-    row_numel = k_src.stride(0)
-    block = 8192
-    grid = (k_src.shape[0], triton.cdiv(row_numel, block))
-    _kv_slot_write_kernel[grid](k_pool, v_pool, k_src, v_src, slots, row_numel, BLOCK=block)
+    k_flat = k_cache.flatten(0, 1)
+    v_flat = v_cache.flatten(0, 1)
+    k_flat[slots] = k_src.to(k_flat.dtype)
+    v_flat[slots] = v_src.to(v_flat.dtype)
 
 
 _LAYER_IDX_TENSORS: dict[int, torch.Tensor] = {}
@@ -667,15 +679,15 @@ def _paged_write_attn_impl(
     if kv is None:
         raise RuntimeError("ar_diffusion_paged_write_attn called before prepare() set the KV pool registry")
     layer_idx = int(layer_idx)
-    k_pool = kv._k_pools[layer_idx]
-    v_pool = kv._v_pools[layer_idx]
-    write_kv_slots(k_pool, v_pool, k_curr, v_curr, video_slots)
+    key_cache = kv.key_cache(layer_idx)
+    value_cache = kv.value_cache(layer_idx)
+    write_kv_slots(key_cache, value_cache, k_curr, v_curr, video_slots)
     if k_act is not None and v_act is not None and k_act.shape[0] > 0:
-        write_kv_slots(k_pool, v_pool, k_act, v_act, action_slots)
+        write_kv_slots(key_cache, value_cache, k_act, v_act, action_slots)
     return ar_diffusion_paged_attention(
         query,
-        kv.key_cache(layer_idx),
-        kv.value_cache(layer_idx),
+        key_cache,
+        value_cache,
         block_table=block_table,
         query_start_loc=query_start_loc,
         seq_lens=seq_lens,

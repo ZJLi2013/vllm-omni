@@ -46,27 +46,19 @@ def set_current_packed_kv_index(
 
 @cache
 def _reshape_and_cache_flash() -> Callable[..., Any] | None:
-    """The stock fused K+V paged-cache write, or ``None`` when unavailable.
+    """vLLM's fused K+V paged-cache write, or ``None`` when unavailable.
 
     This is the op every vLLM attention backend stores KV with: one launch writes
     one K and one V row per token into the slot they share. It replaces a pair of
-    ``index_put_`` calls, which run this shape at 1.47 TB/s where a contiguous copy
-    of the same bytes reaches 6.14 — the cost is the generic indexing path, not the
-    index count (a block-granular ``index_put_`` with 8 indices instead of 1760
-    measures the same).
+    ``index_put_`` calls, which move this shape at 1.32 TB/s against its own 5.10
+    — the cost is the generic indexing path, not the index count (a block-granular
+    ``index_put_`` with 8 indices instead of 1760 measures the same).
 
-    aiter first, since it is the tuned kernel on this platform and its
-    ``module_cache`` extension ships prebuilt (no first-call JIT); vLLM's own
-    ``_C_cache_ops`` entry has the identical signature and covers CUDA. Resolved
-    once per process: importing aiter shells out to ``rocminfo``, and neither
-    import is dynamo-traceable.
+    aiter exposes an identically-signed ``reshape_and_cache_flash``, but it is the
+    slower of the two here (4.07 TB/s on gfx950) and, being ROCm-only, would need
+    this one as a fallback anyway. Resolved once per process, since the import is
+    not dynamo-traceable.
     """
-    try:
-        from aiter.ops.cache import reshape_and_cache_flash
-
-        return reshape_and_cache_flash
-    except Exception:
-        pass
     try:
         from vllm._custom_ops import reshape_and_cache_flash
 

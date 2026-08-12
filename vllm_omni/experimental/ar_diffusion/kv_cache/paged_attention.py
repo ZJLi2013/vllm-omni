@@ -44,6 +44,74 @@ def set_current_packed_kv_index(
     _CURRENT_PACKED_KV_INDEX = (block_table, seq_lens, page, flat, cu_seqlens_k)
 
 
+try:
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def _kv_slot_write_kernel(
+        k_pool,
+        v_pool,
+        k_src,
+        v_src,
+        slots,
+        row_numel,
+        BLOCK: tl.constexpr,
+    ):
+        """Write one K and one V row per program into their shared pool slot.
+
+        ``aten::index_put_`` on this shape runs at 1.47 TB/s where a contiguous
+        copy of the same bytes reaches 6.14; the cost is the generic indexing
+        path, not the index count (a block-granular index_put with 8 indices
+        instead of 1760 measures the same). One program per row keeps every
+        load/store a fully coalesced 10 KiB run, and doing K and V together
+        halves the launches since they share the slot mapping.
+        """
+        row = tl.program_id(0)
+        chunk = tl.program_id(1)
+        slot = tl.load(slots + row)
+        offs = chunk * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < row_numel
+        src_off = row * row_numel + offs
+        dst_off = slot * row_numel + offs
+        tl.store(k_pool + dst_off, tl.load(k_src + src_off, mask=mask), mask=mask)
+        tl.store(v_pool + dst_off, tl.load(v_src + src_off, mask=mask), mask=mask)
+
+except ImportError:  # pragma: no cover - triton ships with the ROCm/CUDA wheels
+    triton = None
+
+
+def _can_fuse_kv_write(k_pool, v_pool, k_src, v_src, slots) -> bool:
+    return (
+        triton is not None
+        and k_pool.is_cuda
+        and k_src.dtype == k_pool.dtype
+        and v_src.dtype == v_pool.dtype
+        and k_src.is_contiguous()
+        and v_src.is_contiguous()
+        and k_pool.is_contiguous()
+        and v_pool.is_contiguous()
+        and slots.numel() == k_src.shape[0]
+    )
+
+
+def write_kv_slots(k_pool, v_pool, k_src, v_src, slots) -> None:
+    """Scatter ``k_src``/``v_src`` rows into the pools at ``slots``.
+
+    Falls back to the indexed write when triton is unavailable or the tensors
+    are not the plain contiguous same-dtype case the kernel assumes (CPU
+    reference path, dtype-converting writes).
+    """
+    if not _can_fuse_kv_write(k_pool, v_pool, k_src, v_src, slots):
+        k_pool[slots] = k_src.to(k_pool.dtype)
+        v_pool[slots] = v_src.to(v_pool.dtype)
+        return
+    row_numel = k_src.stride(0)
+    block = 8192
+    grid = (k_src.shape[0], triton.cdiv(row_numel, block))
+    _kv_slot_write_kernel[grid](k_pool, v_pool, k_src, v_src, slots, row_numel, BLOCK=block)
+
+
 _LAYER_IDX_TENSORS: dict[int, torch.Tensor] = {}
 
 
@@ -601,11 +669,9 @@ def _paged_write_attn_impl(
     layer_idx = int(layer_idx)
     k_pool = kv._k_pools[layer_idx]
     v_pool = kv._v_pools[layer_idx]
-    k_pool[video_slots] = k_curr.to(k_pool.dtype)
-    v_pool[video_slots] = v_curr.to(v_pool.dtype)
+    write_kv_slots(k_pool, v_pool, k_curr, v_curr, video_slots)
     if k_act is not None and v_act is not None and k_act.shape[0] > 0:
-        k_pool[action_slots] = k_act.to(k_pool.dtype)
-        v_pool[action_slots] = v_act.to(v_pool.dtype)
+        write_kv_slots(k_pool, v_pool, k_act, v_act, action_slots)
     return ar_diffusion_paged_attention(
         query,
         kv.key_cache(layer_idx),

@@ -44,6 +44,84 @@ def set_current_packed_kv_index(
     _CURRENT_PACKED_KV_INDEX = (block_table, seq_lens, page, flat, cu_seqlens_k)
 
 
+@cache
+def _reshape_and_cache_flash() -> Callable[..., Any] | None:
+    """vLLM's fused K+V paged-cache write, or ``None`` when unavailable.
+
+    This is the op every vLLM attention backend stores KV with: one launch writes
+    one K and one V row per token into the slot they share. It replaces a pair of
+    ``index_put_`` calls, which move this shape at 1.32 TB/s against its own 5.10
+    — the cost is the generic indexing path, not the index count (a block-granular
+    ``index_put_`` with 8 indices instead of 1760 measures the same).
+
+    aiter exposes an identically-signed ``reshape_and_cache_flash`` -- the same
+    kernel, forked before vLLM vectorised the copy, so it still stores one 2-byte
+    element per thread per step and reaches 4.07 TB/s where this one's 16-byte
+    ``vectorize_with_alignment`` path reaches 5.10. Worth re-pricing once aiter
+    picks that up, though being ROCm-only it would need this as a fallback anyway.
+
+    That vectorised path is guarded on ``head_stride == head_size``, so the caller
+    must hand over the NHD cache view rather than a head-strided one; the
+    contiguity checks below keep us on it. Resolved once per process, since the
+    import is not dynamo-traceable.
+    """
+    try:
+        from vllm._custom_ops import reshape_and_cache_flash
+
+        return reshape_and_cache_flash
+    except Exception:
+        return None
+
+
+_UNIT_SCALES: dict[torch.device, torch.Tensor] = {}
+
+
+def _unit_scale(device: torch.device) -> torch.Tensor:
+    # Unused under kv_cache_dtype="auto" (a straight copy), but the op still
+    # dereferences both scale pointers.
+    scale = _UNIT_SCALES.get(device)
+    if scale is None:
+        scale = torch.ones((), dtype=torch.float32, device=device)
+        _UNIT_SCALES[device] = scale
+    return scale
+
+
+def _can_use_cache_write_op(k_cache, v_cache, k_src, v_src, slots) -> bool:
+    return (
+        k_cache.is_cuda
+        and k_src.dtype == k_cache.dtype
+        and v_src.dtype == v_cache.dtype
+        and k_src.is_contiguous()
+        and v_src.is_contiguous()
+        and k_cache.is_contiguous()
+        and v_cache.is_contiguous()
+        and slots.dtype == torch.int64
+        and slots.numel() == k_src.shape[0]
+    )
+
+
+def write_kv_slots(k_cache, v_cache, k_src, v_src, slots) -> None:
+    """Scatter ``k_src``/``v_src`` rows into the paged caches at ``slots``.
+
+    ``k_cache``/``v_cache`` are ``(num_blocks, block_size, H, D)``; ``slots`` holds
+    one absolute slot (``block_id * block_size + offset``) per source row, which is
+    the layout and the indexing convention the stock op already expects.
+
+    Falls back to the indexed write on the flat views when no such op is available
+    or the tensors are not the plain contiguous same-dtype case it assumes (CPU
+    reference path, dtype-converting writes).
+    """
+    op = _reshape_and_cache_flash()
+    if op is not None and _can_use_cache_write_op(k_cache, v_cache, k_src, v_src, slots):
+        scale = _unit_scale(k_cache.device)
+        op(k_src, v_src, k_cache, v_cache, slots, "auto", scale, scale)
+        return
+    k_flat = k_cache.flatten(0, 1)
+    v_flat = v_cache.flatten(0, 1)
+    k_flat[slots] = k_src.to(k_flat.dtype)
+    v_flat[slots] = v_src.to(v_flat.dtype)
+
+
 _LAYER_IDX_TENSORS: dict[int, torch.Tensor] = {}
 
 
@@ -599,17 +677,15 @@ def _paged_write_attn_impl(
     if kv is None:
         raise RuntimeError("ar_diffusion_paged_write_attn called before prepare() set the KV pool registry")
     layer_idx = int(layer_idx)
-    k_pool = kv._k_pools[layer_idx]
-    v_pool = kv._v_pools[layer_idx]
-    k_pool[video_slots] = k_curr.to(k_pool.dtype)
-    v_pool[video_slots] = v_curr.to(v_pool.dtype)
+    key_cache = kv.key_cache(layer_idx)
+    value_cache = kv.value_cache(layer_idx)
+    write_kv_slots(key_cache, value_cache, k_curr, v_curr, video_slots)
     if k_act is not None and v_act is not None and k_act.shape[0] > 0:
-        k_pool[action_slots] = k_act.to(k_pool.dtype)
-        v_pool[action_slots] = v_act.to(v_pool.dtype)
+        write_kv_slots(key_cache, value_cache, k_act, v_act, action_slots)
     return ar_diffusion_paged_attention(
         query,
-        kv.key_cache(layer_idx),
-        kv.value_cache(layer_idx),
+        key_cache,
+        value_cache,
         block_table=block_table,
         query_start_loc=query_start_loc,
         seq_lens=seq_lens,

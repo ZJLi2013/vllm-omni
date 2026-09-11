@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import base64
@@ -13,7 +16,7 @@ from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 from PIL import Image
 
 from tests.e2e.accuracy.helpers import assert_images_pixel_close, assert_similarity, model_output_dir
-from tests.helpers.env import run_post_test_cleanup, run_pre_test_cleanup
+from tests.helpers.clean import cleanup_test_environment
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServer
 
@@ -30,7 +33,9 @@ NUM_INFERENCE_STEPS = 20
 TRUE_CFG_SCALE = 4.0
 SEED = 42
 SSIM_THRESHOLD = 0.94
-PSNR_THRESHOLD = 30.0
+# With --fa-deterministic, H100 nightlies stably land near SSIM 0.958 / PSNR 27.8
+# vs Diffusers on the FA3 hub path (see #5734 / #5963 / #6971).
+PSNR_THRESHOLD = 27.0
 
 MODEL_2512_ID = "Qwen/Qwen-Image-2512"
 MODEL_2512_ENV_VAR = "QWEN_IMAGE_2512_MODEL"
@@ -68,9 +73,34 @@ def _local_files_only(model: str) -> bool:
     return Path(model).exists()
 
 
+_OMNI_FA3_HUB_BACKEND = "FLASH_ATTN_3_HUB"
+_OMNI_FA3_HUB_ENV = {"DIFFUSION_ATTENTION_BACKEND": _OMNI_FA3_HUB_BACKEND}
+
+
+def _assert_omni_fa3_hub_resolves() -> None:
+    from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
+    from vllm_omni.platforms.cuda.platform import CudaOmniPlatform
+
+    path = CudaOmniPlatform.get_diffusion_attn_backend_cls(_OMNI_FA3_HUB_BACKEND, head_size=128)
+    expected = DiffusionAttentionBackendEnum.FLASH_ATTN_3_HUB.get_path()
+    assert path == expected, path
+    print(f"Resolved Omni attention backend: {_OMNI_FA3_HUB_BACKEND} -> {path}")
+
+
 def _run_vllm_omni_qwen_image(*, model: str, output_path: Path) -> Image.Image:
-    server_args = ["--num-gpus", "1", "--stage-init-timeout", "300", "--init-timeout", "900"]
-    with OmniServer(model, server_args, use_omni=True) as omni_server:
+    _assert_omni_fa3_hub_resolves()
+    server_args = [
+        "--num-gpus",
+        "1",
+        "--stage-init-timeout",
+        "300",
+        "--init-timeout",
+        "900",
+        "--fa-deterministic",
+        "--diffusion-attention-backend",
+        _OMNI_FA3_HUB_BACKEND,
+    ]
+    with OmniServer(model, server_args, use_omni=True, env_dict=_OMNI_FA3_HUB_ENV) as omni_server:
         response = requests.post(
             f"http://{omni_server.host}:{omni_server.port}/v1/images/generations",
             json={
@@ -97,7 +127,7 @@ def _run_vllm_omni_qwen_image(*, model: str, output_path: Path) -> Image.Image:
 
 
 def _run_diffusers_qwen_image(*, model: str, output_path: Path) -> Image.Image:
-    run_pre_test_cleanup()
+    cleanup_test_environment()
     pipe: DiffusionPipeline | None = None
     try:
         pipe = DiffusionPipeline.from_pretrained(
@@ -127,12 +157,22 @@ def _run_diffusers_qwen_image(*, model: str, output_path: Path) -> Image.Image:
         gc.collect()
         if torch.cuda.is_available():
             torch.accelerator.empty_cache()
-        run_post_test_cleanup()
+        cleanup_test_environment()
 
 
 def _run_vllm_omni_qwen_image_2512(*, model: str, output_path: Path) -> Image.Image:
-    server_args = ["--num-gpus", "1", "--stage-init-timeout", "300", "--init-timeout", "900"]
-    with OmniServer(model, server_args, use_omni=True) as omni_server:
+    _assert_omni_fa3_hub_resolves()
+    server_args = [
+        "--num-gpus",
+        "1",
+        "--stage-init-timeout",
+        "300",
+        "--init-timeout",
+        "900",
+        "--diffusion-attention-backend",
+        _OMNI_FA3_HUB_BACKEND,
+    ]
+    with OmniServer(model, server_args, use_omni=True, env_dict=_OMNI_FA3_HUB_ENV) as omni_server:
         response = requests.post(
             f"http://{omni_server.host}:{omni_server.port}/v1/images/generations",
             json={
@@ -159,7 +199,7 @@ def _run_vllm_omni_qwen_image_2512(*, model: str, output_path: Path) -> Image.Im
 
 
 def _run_diffusers_qwen_image_2512(*, model: str, output_path: Path) -> Image.Image:
-    run_pre_test_cleanup()
+    cleanup_test_environment()
     pipe: DiffusionPipeline | None = None
     try:
         pipe = DiffusionPipeline.from_pretrained(
@@ -189,7 +229,7 @@ def _run_diffusers_qwen_image_2512(*, model: str, output_path: Path) -> Image.Im
         gc.collect()
         if torch.cuda.is_available():
             torch.accelerator.empty_cache()
-        run_post_test_cleanup()
+        cleanup_test_environment()
 
 
 @pytest.mark.benchmark

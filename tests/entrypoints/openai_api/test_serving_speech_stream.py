@@ -1,8 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import asyncio
 import base64
 from types import SimpleNamespace
 
 import pytest
+import torch
 from fastapi import FastAPI, WebSocket
 from pytest_mock import MockerFixture
 from starlette.testclient import TestClient
@@ -11,9 +15,22 @@ from starlette.websockets import WebSocketDisconnect
 from vllm_omni.entrypoints.openai import serving_speech_stream as streaming_speech_module
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.serving_speech_stream import OmniStreamingSpeechHandler
-from vllm_omni.utils.forced_aligner import WordTimestamp
+from vllm_omni.model_executor.stage_input_processors.forced_aligner import ALIGNER_WORDS_KEY
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def _fake_aligner_res(pairs, words):
+    """Build a stand-in for the forced-aligner stage's pooling output.
+
+    Mirrors what rides the generator in production: ``res.outputs.data`` is a
+    ``[n_words, 2]`` int32 tensor of ``[start_ms, end_ms]`` and the word strings
+    travel in ``additional_information``. Decoded by ``extract_word_timestamps``.
+    """
+    return SimpleNamespace(
+        outputs=SimpleNamespace(data=torch.tensor(pairs, dtype=torch.int32), additional_information=None),
+        additional_information={ALIGNER_WORDS_KEY: list(words)},
+    )
 
 
 def _build_test_app(
@@ -28,9 +45,11 @@ def _build_test_app(
         speech_service = mocker.MagicMock(spec=OmniOpenAIServingSpeech)
         speech_service._generate_audio_bytes = mocker.AsyncMock(return_value=(b"RIFF" + b"\x00" * 32, "audio/wav"))
         speech_service._prepare_speech_generation = mocker.AsyncMock(return_value=("req-1", object(), {}))
-        speech_service.forced_aligner_config = None
+        speech_service.forced_aligner_enabled = False
 
-        async def mock_generate_pcm_chunks(_generator, _request_id, *, include_sample_rate=False):
+        async def mock_generate_pcm_chunks(
+            _generator, _request_id, *, include_sample_rate=False, tts_params=None, collect=None
+        ):
             for chunk in (b"\x01\x02", b"\x03\x04\x05"):
                 yield (chunk, 24000) if include_sample_rate else chunk
 
@@ -178,7 +197,7 @@ class TestStreamingSpeechWebSocket:
 
                 error = ws.receive_json()
                 assert error["type"] == "error"
-                assert "while input is buffered" in error["message"]
+                assert "while an utterance is in progress" in error["message"]
 
                 # The buffered text survives the rejected reconfiguration.
                 ws.send_json({"type": "input.done"})
@@ -230,20 +249,22 @@ class TestStreamingSpeechWebSocket:
 
     def test_streaming_multiple_binary_frames(self, mocker: MockerFixture):
         captured_requests = []
+        captured_tts_params = []
 
         speech_service = mocker.MagicMock(spec=OmniOpenAIServingSpeech)
         speech_service._generate_audio_bytes = mocker.AsyncMock(return_value=(b"", "audio/wav"))
         speech_service.engine_client = mocker.MagicMock()
         speech_service.engine_client.abort = mocker.AsyncMock()
-        speech_service.forced_aligner_config = None
+        speech_service.forced_aligner_enabled = False
 
         async def mock_prepare_speech_generation(request):
             captured_requests.append(request)
-            return "req-stream", object(), {}
+            return "req-stream", object(), {"_qwen3_tts_effective_max_tokens": [192]}
 
         speech_service._prepare_speech_generation = mock_prepare_speech_generation
 
-        async def mock_generate_pcm_chunks(_generator, _request_id, *, include_sample_rate=False):
+        async def mock_generate_pcm_chunks(_generator, _request_id, *, include_sample_rate=False, tts_params=None):
+            captured_tts_params.append(tts_params)
             for chunk in (b"\x01\x02", b"\x03\x04\x05", b"\x06"):
                 yield (chunk, 24000) if include_sample_rate else chunk
 
@@ -288,6 +309,7 @@ class TestStreamingSpeechWebSocket:
         assert captured_requests[0].stream is True
         assert captured_requests[0].response_format == "pcm"
         assert captured_requests[0].initial_codec_chunk_frames == 12
+        assert captured_tts_params == [{"_qwen3_tts_effective_max_tokens": [192]}]
         assert speech_service._generate_audio_bytes.await_count == 0
 
     def test_word_timestamps_requires_configured_aligner(self, mocker: MockerFixture):
@@ -311,13 +333,13 @@ class TestStreamingSpeechWebSocket:
                 assert error["type"] == "error"
                 assert "without --forced-aligner" in error["message"]
 
-    def test_word_timestamps_emit_sidecar_json_frame(self, mocker: MockerFixture):
+    def test_word_timestamps_emit_pipeline_json_frame(self, mocker: MockerFixture):
         captured_requests = []
         speech_service = mocker.MagicMock(spec=OmniOpenAIServingSpeech)
         speech_service._generate_audio_bytes = mocker.AsyncMock(return_value=(b"", "audio/wav"))
         speech_service.engine_client = mocker.MagicMock()
         speech_service.engine_client.abort = mocker.AsyncMock()
-        speech_service.forced_aligner_config = SimpleNamespace(model="aligner")
+        speech_service.forced_aligner_enabled = True
 
         async def mock_prepare_speech_generation(request):
             captured_requests.append(request)
@@ -328,19 +350,17 @@ class TestStreamingSpeechWebSocket:
         first_chunk = b"\x01" * 1000
         second_chunk = b"\x02" * 1000
 
-        async def mock_generate_pcm_chunks(_generator, _request_id, *, include_sample_rate=False):
+        # The forced-aligner stage rides the same generator: its pooling output
+        # is surfaced via the ``collect`` channel once the audio has streamed.
+        async def mock_generate_pcm_chunks(
+            _generator, _request_id, *, include_sample_rate=False, tts_params=None, collect=None
+        ):
             for chunk in (first_chunk, second_chunk):
                 yield (chunk, 1000) if include_sample_rate else chunk
+            if collect is not None:
+                collect["aligner_res"] = _fake_aligner_res([[0, 200], [200, 900]], ["Hello", "world"])
 
         speech_service._generate_pcm_chunks = mock_generate_pcm_chunks
-        # Sentence-level: aligner runs once over the whole sentence audio.
-        mock_align = mocker.AsyncMock(
-            return_value=[
-                WordTimestamp("Hello", 0, 200),
-                WordTimestamp("world", 200, 900),
-            ]
-        )
-        mocker.patch.object(streaming_speech_module, "forced_align", mock_align)
         app, _ = _build_test_app(speech_service)
 
         with TestClient(app) as client:
@@ -406,7 +426,6 @@ class TestStreamingSpeechWebSocket:
                 }
 
         assert captured_requests[0].word_timestamps is True
-        assert mock_align.await_count == 1
 
     def test_word_timestamps_emit_word_dicts(self, mocker: MockerFixture):
         # The streaming layer forwards the aligner's (already monotonic,
@@ -415,21 +434,18 @@ class TestStreamingSpeechWebSocket:
         speech_service._generate_audio_bytes = mocker.AsyncMock(return_value=(b"", "audio/wav"))
         speech_service.engine_client = mocker.MagicMock()
         speech_service.engine_client.abort = mocker.AsyncMock()
-        speech_service.forced_aligner_config = SimpleNamespace(model="aligner")
+        speech_service.forced_aligner_enabled = True
         speech_service._prepare_speech_generation = mocker.AsyncMock(return_value=("req", object(), {}))
 
-        async def mock_generate_pcm_chunks(_generator, _request_id, *, include_sample_rate=False):
+        async def mock_generate_pcm_chunks(
+            _generator, _request_id, *, include_sample_rate=False, tts_params=None, collect=None
+        ):
             chunk = b"\x01" * 1000
             yield (chunk, 1000) if include_sample_rate else chunk
+            if collect is not None:
+                collect["aligner_res"] = _fake_aligner_res([[0, 1000], [1000, 1200]], ["Hello", "world"])
 
         speech_service._generate_pcm_chunks = mock_generate_pcm_chunks
-        mock_align = mocker.AsyncMock(
-            return_value=[
-                WordTimestamp("Hello", 0, 1000),
-                WordTimestamp("world", 1000, 1200),
-            ]
-        )
-        mocker.patch.object(streaming_speech_module, "forced_align", mock_align)
         app, _ = _build_test_app(speech_service)
 
         with TestClient(app) as client:
@@ -572,7 +588,7 @@ class TestStreamingSpeechWebSocket:
         speech_service._generate_pcm_chunks = mocker.AsyncMock()
         speech_service.engine_client = mocker.MagicMock()
         speech_service.engine_client.abort = mocker.AsyncMock()
-        speech_service.forced_aligner_config = None
+        speech_service.forced_aligner_enabled = False
         app, _ = _build_test_app(speech_service)
 
         with TestClient(app) as client:
@@ -602,9 +618,9 @@ class TestStreamingSpeechWebSocket:
         speech_service._prepare_speech_generation = mocker.AsyncMock(return_value=("req-stream-err", object(), {}))
         speech_service.engine_client = mocker.MagicMock()
         speech_service.engine_client.abort = mocker.AsyncMock()
-        speech_service.forced_aligner_config = None
+        speech_service.forced_aligner_enabled = False
 
-        async def mock_generate_pcm_chunks(_generator, _request_id, *, include_sample_rate=False):
+        async def mock_generate_pcm_chunks(_generator, _request_id, *, include_sample_rate=False, tts_params=None):
             yield b"\x01\x02"
             raise RuntimeError("stream boom")
 
@@ -629,6 +645,8 @@ class TestStreamingSpeechWebSocket:
                 assert ws.receive_json() == {
                     "type": "error",
                     "message": "Generation failed for utterance 0, sentence 0: stream boom",
+                    "partial_audio": True,
+                    "action": "discard",
                 }
                 assert ws.receive_json() == {
                     "type": "audio.done",
@@ -696,9 +714,9 @@ class TestStreamingSpeechWebSocket:
         speech_service._prepare_speech_generation = mocker.AsyncMock(return_value=("req-abort", object(), {}))
         speech_service.engine_client = mocker.MagicMock()
         speech_service.engine_client.abort = mocker.AsyncMock()
-        speech_service.forced_aligner_config = None
+        speech_service.forced_aligner_enabled = False
 
-        async def mock_generate_pcm_chunks(_generator, _request_id, *, include_sample_rate=False):
+        async def mock_generate_pcm_chunks(_generator, _request_id, *, include_sample_rate=False, tts_params=None):
             yield b"\x01\x02"
 
         speech_service._generate_pcm_chunks = mock_generate_pcm_chunks
@@ -724,6 +742,8 @@ class TestStreamingSpeechWebSocket:
         config.speaker_embedding = None
         config.stream_audio = True
         config.word_timestamps = False
+        config.seed = None
+        config.non_streaming_mode = None
 
         with pytest.raises(WebSocketDisconnect):
             asyncio.run(
@@ -738,6 +758,163 @@ class TestStreamingSpeechWebSocket:
 
         speech_service.engine_client.abort.assert_awaited_once_with("req-abort")
         assert websocket.send_json.await_count == 2
+
+
+class TestWebSocketSentenceSplitting:
+    def test_sentence_granularity_emits_one_request_per_sentence(self, mocker: MockerFixture):
+        app, speech_service = _build_test_app(mocker=mocker)
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/audio/speech/stream") as ws:
+                ws.send_json(
+                    {
+                        "type": "session.config",
+                        "voice": "Vivian",
+                        "split_granularity": "sentence",
+                    }
+                )
+                ws.send_json({"type": "input.text", "text": "Hello world. How are you? "})
+                ws.send_json({"type": "input.done"})
+
+                first = ws.receive_json()
+                assert first["sentence_index"] == 0
+                assert first["sentence_text"] == "Hello world."
+                ws.receive_bytes()
+                assert ws.receive_json()["type"] == "audio.done"
+
+                second = ws.receive_json()
+                assert second["sentence_index"] == 1
+                assert second["sentence_text"] == "How are you?"
+                ws.receive_bytes()
+                assert ws.receive_json()["type"] == "audio.done"
+
+                assert ws.receive_json() == {
+                    "type": "session.done",
+                    "utterance_index": 0,
+                    "total_sentences": 2,
+                }
+
+        assert speech_service._generate_audio_bytes.await_count == 2
+        assert [call.args[0].input for call in speech_service._generate_audio_bytes.await_args_list] == [
+            "Hello world.",
+            "How are you?",
+        ]
+
+    def test_sentence_granularity_emits_before_input_done(self, mocker: MockerFixture):
+        app, speech_service = _build_test_app(mocker=mocker)
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/audio/speech/stream") as ws:
+                ws.send_json(
+                    {
+                        "type": "session.config",
+                        "voice": "Vivian",
+                        "split_granularity": "sentence",
+                    }
+                )
+                ws.send_json({"type": "input.text", "text": "First sentence. "})
+
+                start = ws.receive_json()
+                assert start["sentence_text"] == "First sentence."
+                ws.receive_bytes()
+                assert ws.receive_json()["type"] == "audio.done"
+                assert speech_service._generate_audio_bytes.await_count == 1
+
+                ws.send_json({"type": "input.done"})
+                assert ws.receive_json() == {
+                    "type": "session.done",
+                    "utterance_index": 0,
+                    "total_sentences": 1,
+                }
+
+    def test_indic_danda_splits_without_latin_period(self, mocker: MockerFixture):
+        app, speech_service = _build_test_app(mocker=mocker)
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/audio/speech/stream") as ws:
+                ws.send_json(
+                    {
+                        "type": "session.config",
+                        "voice": "Vivian",
+                        "language": "Auto",
+                        "split_granularity": "sentence",
+                    }
+                )
+                ws.send_json({"type": "input.text", "text": "नमस्ते। कैसे हो?"})
+                ws.send_json({"type": "input.done"})
+
+                first = ws.receive_json()
+                assert first["sentence_text"] == "नमस्ते।"
+                ws.receive_bytes()
+                assert ws.receive_json()["type"] == "audio.done"
+
+                second = ws.receive_json()
+                assert second["sentence_text"] == "कैसे हो?"
+                ws.receive_bytes()
+                assert ws.receive_json()["type"] == "audio.done"
+                assert ws.receive_json()["total_sentences"] == 2
+
+    def test_session_config_rejected_after_a_split_unit_was_emitted(self, mocker: MockerFixture):
+        """The splitter buffer is empty here, but the utterance is still open."""
+        app, speech_service = _build_test_app(mocker=mocker)
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/audio/speech/stream") as ws:
+                ws.send_json(
+                    {
+                        "type": "session.config",
+                        "voice": "Vivian",
+                        "split_granularity": "sentence",
+                    }
+                )
+                ws.send_json({"type": "input.text", "text": "First sentence. "})
+                ws.receive_json()
+                ws.receive_bytes()
+                assert ws.receive_json()["type"] == "audio.done"
+
+                ws.send_json({"type": "session.config", "voice": "Serena"})
+                error = ws.receive_json()
+                assert error["type"] == "error"
+                assert "while an utterance is in progress" in error["message"]
+
+                ws.send_json({"type": "input.text", "text": "Second sentence. "})
+                assert ws.receive_json()["sentence_index"] == 1
+                ws.receive_bytes()
+                assert ws.receive_json()["type"] == "audio.done"
+
+                ws.send_json({"type": "input.done"})
+                assert ws.receive_json() == {
+                    "type": "session.done",
+                    "utterance_index": 0,
+                    "total_sentences": 2,
+                }
+
+                # Reconfiguration is allowed again once the utterance closed.
+                ws.send_json({"type": "session.config", "voice": "Serena"})
+                ws.send_json({"type": "input.text", "text": "Third."})
+                ws.send_json({"type": "input.done"})
+                ws.receive_json()
+                ws.receive_bytes()
+                ws.receive_json()
+                ws.receive_json()
+
+        voices = [call.args[0].voice for call in speech_service._generate_audio_bytes.await_args_list]
+        assert voices == ["Vivian", "Vivian", "Serena"]
+
+    def test_seed_is_forwarded_to_speech_request(self, mocker: MockerFixture):
+        app, speech_service = _build_test_app(mocker=mocker)
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/audio/speech/stream") as ws:
+                ws.send_json({"type": "session.config", "voice": "Vivian", "seed": 42})
+                ws.send_json({"type": "input.text", "text": "Hello."})
+                ws.send_json({"type": "input.done"})
+                ws.receive_json()
+                ws.receive_bytes()
+                ws.receive_json()
+                ws.receive_json()
+
+        assert speech_service._generate_audio_bytes.await_args_list[0].args[0].seed == 42
 
 
 class TestGeneratePcmChunksContract:

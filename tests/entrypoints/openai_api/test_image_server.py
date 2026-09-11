@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 Tests for async image generation API endpoints.
 
@@ -24,11 +24,13 @@ from vllm.entrypoints.openai.models.protocol import BaseModelPath
 from vllm.sampling_params import RequestOutputKind
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
-from vllm_omni.entrypoints.openai.api_server import _check_max_generated_image_size, _DiffusionServingModels, router
+from vllm_omni.entrypoints.openai.api_server import router
 from vllm_omni.entrypoints.openai.image_api_utils import (
     encode_image_base64,
     parse_size,
 )
+from vllm_omni.entrypoints.openai.images.helpers import _check_max_generated_image_size
+from vllm_omni.entrypoints.openai.models.serving import _DiffusionServingModels
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.errors import GuardrailViolationError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -117,11 +119,23 @@ def test_encode_image_base64():
 class MockGenerationResult:
     """Mock result object compatible with current diffusion output shape."""
 
-    def __init__(self, images):
+    def __init__(self, images, stage_durations=None, peak_memory_mb=0.0):
         self.images = images
-        self.request_output = SimpleNamespace(images=images)
-        self.stage_durations = {}
-        self.peak_memory_mb = 0.0
+        self.stage_durations = {} if stage_durations is None else stage_durations
+        self.peak_memory_mb = peak_memory_mb
+
+
+def _stub_engine_generate_with_metrics(engine, *, stage_durations, peak_memory_mb):
+    """Stub engine.generate to return profiler metrics."""
+
+    async def generate(*args, **kwargs):
+        yield MockGenerationResult(
+            [Image.new("RGB", (16, 16), color="blue")],
+            stage_durations=stage_durations,
+            peak_memory_mb=peak_memory_mb,
+        )
+
+    engine.generate = generate
 
 
 class MockStageResult:
@@ -137,10 +151,7 @@ class MockStageResult:
             outputs = [SimpleNamespace(text=text, index=0)]
         else:
             outputs = []
-        self.request_output = SimpleNamespace(
-            outputs=outputs,
-            images=self.images,
-        )
+        self.outputs = outputs
         self.stage_durations = {}
         self.peak_memory_mb = 0.0
 
@@ -210,7 +221,7 @@ def test_client(mock_async_diffusion):
     app.state.stage_configs = [SimpleNamespace(stage_type="diffusion")]
     from vllm.entrypoints.openai.models.protocol import BaseModelPath
 
-    from vllm_omni.entrypoints.openai.api_server import _DiffusionServingModels
+    from vllm_omni.entrypoints.openai.models.serving import _DiffusionServingModels
 
     app.state.openai_serving_models = _DiffusionServingModels(
         [BaseModelPath(name="Qwen/Qwen-Image", model_path="Qwen/Qwen-Image")]
@@ -221,6 +232,17 @@ def test_client(mock_async_diffusion):
     )
 
     return TestClient(app)
+
+
+@pytest.fixture
+def lingbot_test_client(test_client):
+    test_client.app.state.stage_configs = [
+        SimpleNamespace(
+            stage_type="diffusion",
+            engine_args={"model_class_name": "LingBotVideoPipeline"},
+        )
+    ]
+    return test_client
 
 
 @pytest.fixture
@@ -963,6 +985,53 @@ def test_image_edits_streaming_rejects_single_stage_before_loading_url(test_clie
 
     assert response.status_code == 400
     assert "multi-stage" in response.json()["detail"]
+
+
+def test_generate_images_returns_metrics_single_stage(test_client):
+    """Single-stage /v1/images/generations copies getattr metrics onto the response."""
+    stage_durations = {"queue_wait_ms": 1.0, "stage_0_gen_ms": 2.0}
+    peak_memory_mb = 1024.0
+    _stub_engine_generate_with_metrics(
+        test_client.app.state.engine_client,
+        stage_durations=stage_durations,
+        peak_memory_mb=peak_memory_mb,
+    )
+
+    response = test_client.post(
+        "/v1/images/generations",
+        json={"prompt": "a cat", "n": 1, "size": "256x256"},
+    )
+    assert response.status_code == 200
+    assert response.json()["metrics"] == {
+        "stage_durations": stage_durations,
+        "peak_memory_mb": peak_memory_mb,
+    }
+
+
+def test_generate_images_returns_metrics_multistage(async_omni_test_client):
+    """Multi-stage /v1/images/generations unpacks generate_diffusion_images metrics."""
+    stage_durations = {
+        "queue_wait_ms": 1.0,
+        "preprocess_ms": 2.0,
+        "stage_0_gen_ms": 3.0,
+        "stage_1_gen_ms": 4.0,
+    }
+    peak_memory_mb = 2048.0
+    _stub_engine_generate_with_metrics(
+        async_omni_test_client.app.state.engine_client,
+        stage_durations=stage_durations,
+        peak_memory_mb=peak_memory_mb,
+    )
+
+    response = async_omni_test_client.post(
+        "/v1/images/generations",
+        json={"prompt": "a cat", "n": 1, "size": "256x256"},
+    )
+    assert response.status_code == 200
+    assert response.json()["metrics"] == {
+        "stage_durations": stage_durations,
+        "peak_memory_mb": peak_memory_mb,
+    }
 
 
 def test_generate_images_max_size_rejected(async_omni_test_client):
@@ -1980,6 +2049,56 @@ def test_image_edit_with_seed_zero(async_omni_test_client):
     )
 
 
+def test_image_edits_returns_metrics_single_stage(test_client):
+    """Single-stage /v1/images/edits copies getattr metrics onto the response."""
+    stage_durations = {"queue_wait_ms": 1.0, "stage_0_gen_ms": 2.0}
+    peak_memory_mb = 1024.0
+    _stub_engine_generate_with_metrics(
+        test_client.app.state.engine_client,
+        stage_durations=stage_durations,
+        peak_memory_mb=peak_memory_mb,
+    )
+
+    response = test_client.post(
+        "/v1/images/edits",
+        files=[("image", make_test_image_bytes((16, 16)))],
+        data={"prompt": "edit me"},
+    )
+    assert response.status_code == 200
+    assert response.json()["metrics"] == {
+        "stage_durations": stage_durations,
+        "peak_memory_mb": peak_memory_mb,
+    }
+
+
+def test_image_edits_returns_metrics_multistage(async_omni_test_client):
+    """Multi-stage /v1/images/edits unpacks generate_diffusion_images metrics."""
+    stage_durations = {
+        "queue_wait_ms": 1.0,
+        "preprocess_ms": 2.0,
+        "ar2diffusion_ms": 3.0,
+        "stage_0_gen_ms": 4.0,
+        "stage_1_gen_ms": 5.0,
+    }
+    peak_memory_mb = 2048.0
+    _stub_engine_generate_with_metrics(
+        async_omni_test_client.app.state.engine_client,
+        stage_durations=stage_durations,
+        peak_memory_mb=peak_memory_mb,
+    )
+
+    response = async_omni_test_client.post(
+        "/v1/images/edits",
+        files=[("image", make_test_image_bytes((16, 16)))],
+        data={"prompt": "edit me"},
+    )
+    assert response.status_code == 200
+    assert response.json()["metrics"] == {
+        "stage_durations": stage_durations,
+        "peak_memory_mb": peak_memory_mb,
+    }
+
+
 def test_image_edit_with_seed_zero_single_stage(test_client):
     """Test that seed=0 is correctly handled in image editing (single stage).
 
@@ -2009,7 +2128,7 @@ def test_normalize_image():
     """Test _normalize_image with various input types"""
     import numpy as np
 
-    from vllm_omni.entrypoints.openai.api_server import _normalize_image
+    from vllm_omni.entrypoints.openai.images.helpers import _normalize_image
 
     # Test PIL Image input
     img = Image.new("RGB", (64, 64), color="red")
@@ -2046,7 +2165,7 @@ def test_extract_images_from_result():
     """Test _extract_images_from_result with various result formats"""
     import numpy as np
 
-    from vllm_omni.entrypoints.openai.api_server import _extract_images_from_result
+    from vllm_omni.entrypoints.openai.images.helpers import _extract_images_from_result
 
     # Test empty result
     class EmptyResult:
@@ -2069,22 +2188,20 @@ def test_extract_images_from_result():
     assert all(isinstance(img, Image.Image) for img in images)
     assert all(img.size == (64, 64) for img in images)
 
-    # Test dict path: result.request_output["images"]
+    # Test result with "images" attribute set in __init__
     class DictRequestOutput:
         def __init__(self):
-            self.request_output = {"images": [np.random.randint(0, 255, (64, 64, 3), dtype=np.uint8)]}
+            self.images = [np.random.randint(0, 255, (64, 64, 3), dtype=np.uint8)]
 
     result = DictRequestOutput()
     images = _extract_images_from_result(result)
     assert len(images) == 1
     assert isinstance(images[0], Image.Image)
 
-    # Test attribute path: result.request_output.images
+    # Test result with "images" attribute from an inner object
     class AttrRequestOutput:
         def __init__(self):
-            self.request_output = type(
-                "obj", (), {"images": [np.random.randint(0, 255, (32, 32, 3), dtype=np.uint8)]}
-            )()
+            self.images = [np.random.randint(0, 255, (32, 32, 3), dtype=np.uint8)]
 
     result = AttrRequestOutput()
     images = _extract_images_from_result(result)

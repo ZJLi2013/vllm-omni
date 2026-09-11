@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from pathlib import Path
 
@@ -42,10 +42,10 @@ _QUALITY_CONFIG = QualityTestConfig(
 
 
 def _resolve_fl2va_model_ref() -> str:
-    from huggingface_hub import snapshot_download
+    from vllm_omni.transformers_utils.repo_utils import hf_api
 
     repo_root = Path(
-        snapshot_download(
+        hf_api().snapshot_download(
             repo_id=_MINIMAX_H3_REPO,
             revision=_MINIMAX_H3_REVISION,
             allow_patterns=["FL2VA/**"],
@@ -135,18 +135,13 @@ def _generate_joint_output(omni, config: QualityTestConfig):
             num_frames=config.num_frames,
             guidance_scale=config.guidance_scale,
             sigmas=config.sigmas,
+            extra_args={"aspect_ratio": "16:9"},
         ),
     )
     main_process_peak_mem = torch.accelerator.max_memory_allocated() / (1024**3)
 
     first = outputs[0]
     worker_peak_memory_mb = float(getattr(first, "peak_memory_mb", 0.0) or 0.0)
-    if hasattr(first, "request_output") and isinstance(first.request_output, list):
-        first = first.request_output[0]
-        worker_peak_memory_mb = max(
-            worker_peak_memory_mb,
-            float(getattr(first, "peak_memory_mb", 0.0) or 0.0),
-        )
     if not hasattr(first, "images") or not first.images:
         raise ValueError("Could not extract video frames from H3 output")
     frames = first.images[0]
@@ -192,6 +187,7 @@ def test_minimax_h3_quantization_quality(config: QualityTestConfig):
         "model": model_ref,
         "enforce_eager": True,
         "tensor_parallel_size": 2,
+        # The fused BF16 baseline only fits on H100-80GB with encoder TP.
         "text_encoder_tp_size": 2,
         "vae_use_tiling": True,
     }
@@ -257,13 +253,13 @@ def test_resolve_fl2va_model_ref(tmp_path, monkeypatch):
     fl2va_root.mkdir()
     (fl2va_root / "model_index.json").write_text("{}", encoding="utf-8")
 
-    def fake_snapshot_download(*, repo_id, revision, allow_patterns):
+    def fake_snapshot_download(self, *, repo_id, revision, allow_patterns):
         assert repo_id == _MINIMAX_H3_REPO
         assert revision == _MINIMAX_H3_REVISION
         assert allow_patterns == ["FL2VA/**"]
         return str(tmp_path)
 
-    monkeypatch.setattr("huggingface_hub.snapshot_download", fake_snapshot_download)
+    monkeypatch.setattr("huggingface_hub.HfApi.snapshot_download", fake_snapshot_download)
     assert _resolve_fl2va_model_ref() == str(fl2va_root)
 
 

@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+from importlib import import_module
 from importlib.util import find_spec
 
 import torch
@@ -46,6 +50,8 @@ def apply_rotary_emb_mindiesd(
 ) -> torch.Tensor:
     from mindiesd import rotary_position_embedding
 
+    x, squeezed = _ensure_batch_dim(x)
+
     if cos.dim() == 3:
         # (B, S, D/2) -> (S, D/2)
         cos = cos[0]
@@ -57,13 +63,14 @@ def apply_rotary_emb_mindiesd(
             seqlen = cos.shape[0]
             sin = sin.unsqueeze(0).unsqueeze(2).unsqueeze(-1).expand(-1, -1, -1, -1, 2).reshape(1, seqlen, 1, -1)
             cos = cos.unsqueeze(0).unsqueeze(2).unsqueeze(-1).expand(-1, -1, -1, -1, 2).reshape(1, seqlen, 1, -1)
-        return rotary_position_embedding(x, cos, sin, rotated_mode="rotated_interleaved", head_first=False, fused=True)
+        out = rotary_position_embedding(x, cos, sin, rotated_mode="rotated_interleaved", head_first=False, fused=True)
     else:
         if half_head_dim:
             seqlen = cos.shape[0]
             sin = sin.unsqueeze(0).unsqueeze(2).repeat(1, 1, 1, 2)
             cos = cos.unsqueeze(0).unsqueeze(2).repeat(1, 1, 1, 2)
-        return rotary_position_embedding(x, cos, sin, rotated_mode="rotated_half", head_first=False, fused=True)
+        out = rotary_position_embedding(x, cos, sin, rotated_mode="rotated_half", head_first=False, fused=True)
+    return _restore_batch_dim(out, squeezed)
 
 
 def _ensure_batch_dim(x: torch.Tensor) -> tuple[torch.Tensor, bool]:
@@ -89,11 +96,13 @@ class RotaryEmbedding(CustomOp):
            of 1st half and 2nd half (GPT-NeoX style).
     """
 
-    def __init__(self, is_neox_style: bool = False) -> None:
+    def __init__(self, is_neox_style: bool = False, half_head_dim: bool = True) -> None:
         super().__init__()
         self.is_neox_style = is_neox_style
         self.interleaved = not is_neox_style
+        self.half_head_dim = half_head_dim
         self.apply_rotary_emb_flash_attn = None
+        self.apply_rotary_emb_vllm_flash_attn = None
         self.has_mindie = False
         # ``find_spec("flash_attn")`` is True as long as *any* package publishes
         # the ``flash_attn`` namespace — including ``flash-attn-4``, which ships
@@ -107,8 +116,34 @@ class RotaryEmbedding(CustomOp):
                 self.apply_rotary_emb_flash_attn = apply_rotary
             except ImportError:
                 pass
+        # CUDA wheels vendor this kernel under vllm_flash_attn, while source
+        # and CPU-only installations may not contain the generated package.
+        # Resolve it lazily and retain the native implementation as a portable
+        # fallback for those environments.
+        if current_omni_platform.is_cuda():
+            try:
+                self.apply_rotary_emb_vllm_flash_attn = import_module(
+                    "vllm.vllm_flash_attn.layers.rotary"
+                ).apply_rotary_emb
+            except ImportError:
+                pass
         if find_spec("mindiesd") is not None:
             self.has_mindie = True
+
+    def _prepare_half_head_dim_cos_sin(
+        self,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Normalize shared cos/sin to the half-dim layout used by CUDA/native kernels."""
+        if cos.dim() == 3:
+            # All batch elements share the same rotary position encoding.
+            cos = cos[0]
+            sin = sin[0]
+        if not self.half_head_dim:
+            cos = cos[..., ::2] if self.interleaved else cos[..., : cos.shape[-1] // 2]
+            sin = sin[..., ::2] if self.interleaved else sin[..., : sin.shape[-1] // 2]
+        return cos, sin
 
     def forward_cuda(
         self,
@@ -116,15 +151,18 @@ class RotaryEmbedding(CustomOp):
         cos: torch.Tensor,
         sin: torch.Tensor,
     ) -> torch.Tensor:
-        from vllm.vllm_flash_attn.layers.rotary import apply_rotary_emb
+        cos, sin = self._prepare_half_head_dim_cos_sin(cos, sin)
 
-        if cos.dim() == 3:
-            # (B, S, D/2) -> (S, D/2)
-            cos = cos[0]
-            sin = sin[0]
+        if self.apply_rotary_emb_vllm_flash_attn is None:
+            return apply_rotary_emb_torch(
+                x,
+                cos,
+                sin,
+                interleaved=self.interleaved,
+            )
 
         x, squeezed = _ensure_batch_dim(x)
-        output = apply_rotary_emb(
+        output = self.apply_rotary_emb_vllm_flash_attn(
             x,
             cos,
             sin,
@@ -141,10 +179,7 @@ class RotaryEmbedding(CustomOp):
         if self.apply_rotary_emb_flash_attn is None:
             return self.forward_cuda(x, cos, sin)
 
-        if cos.dim() == 3:
-            # (B, S, D/2) -> (S, D/2)
-            cos = cos[0]
-            sin = sin[0]
+        cos, sin = self._prepare_half_head_dim_cos_sin(cos, sin)
 
         x, squeezed = _ensure_batch_dim(x)
         output = self.apply_rotary_emb_flash_attn(
@@ -162,17 +197,9 @@ class RotaryEmbedding(CustomOp):
         sin: torch.Tensor,
     ) -> torch.Tensor:
         if self.has_mindie:
-            return apply_rotary_emb_mindiesd(x, cos, sin, self.interleaved)
+            return apply_rotary_emb_mindiesd(x, cos, sin, self.interleaved, self.half_head_dim)
         else:
             return self.forward_native(x, cos, sin)
-
-    def forward_xpu(
-        self,
-        x: torch.Tensor,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-    ) -> torch.Tensor:
-        return self.forward_native(x, cos, sin)
 
     def forward_musa(
         self,
@@ -180,7 +207,16 @@ class RotaryEmbedding(CustomOp):
         cos: torch.Tensor,
         sin: torch.Tensor,
     ) -> torch.Tensor:
-        return self.forward_native(x, cos, sin)
+        # Keep the full-dimension NeoX form inline for MUSA compilation.
+        # Other layouts use the shared native implementation.
+        if self.half_head_dim or self.interleaved:
+            return self.forward_native(x, cos, sin)
+        if cos.dim() == 3:
+            cos, sin = cos[0], sin[0]
+        cos = cos.unsqueeze(-2)
+        sin = sin.unsqueeze(-2)
+        x1, x2 = x.chunk(2, dim=-1)
+        return x * cos + torch.cat((-x2, x1), dim=-1) * sin
 
     def forward_native(
         self,
@@ -191,9 +227,7 @@ class RotaryEmbedding(CustomOp):
         # All batch elements share the same rotary position encoding.
         # Strip the batch dim so the underlying op broadcasts over the batch,
         # consistent with forward_cuda / forward_hip / apply_rotary_emb_mindiesd.
-        if cos.dim() == 3:
-            cos = cos[0]
-            sin = sin[0]
+        cos, sin = self._prepare_half_head_dim_cos_sin(cos, sin)
         return apply_rotary_emb_torch(
             x,
             cos,
@@ -219,13 +253,14 @@ class RotaryEmbeddingWan(RotaryEmbedding):
         cos: torch.Tensor,
         sin: torch.Tensor,
     ) -> torch.Tensor:
-        from vllm.vllm_flash_attn.layers.rotary import apply_rotary_emb
+        if self.apply_rotary_emb_vllm_flash_attn is None:
+            return self.forward_native(x, cos, sin)
 
         if cos.dim() > 2:
             cos = cos.reshape(-1, cos.shape[-1])
             sin = sin.reshape(-1, sin.shape[-1])
 
-        return apply_rotary_emb(
+        return self.apply_rotary_emb_vllm_flash_attn(
             x,
             cos,
             sin,
@@ -403,16 +438,16 @@ class WanS2VRotaryPosEmbed(torch.nn.Module):
                         h_sam = torch.linspace(int(h_o), int(t_h + h_o) - 1, seq_h_int, device=device).long()
                         w_sam = torch.linspace(int(w_o), int(t_w + w_o) - 1, seq_w_int, device=device).long()
 
-                        freqs_0 = freqs_split[0][f_sam] if f_o >= 0 else freqs_split[0][f_sam].conj()
+                        freqs_0 = torch.index_select(freqs_split[0] if f_o >= 0 else freqs_split[0].conj(), 0, f_sam)
                         freqs_0 = freqs_0.view(seq_f_int, 1, 1, -1)
 
                         freqs_i = torch.cat(
                             [
                                 freqs_0.expand(seq_f_int, seq_h_int, seq_w_int, -1),
-                                freqs_split[1][h_sam]
+                                torch.index_select(freqs_split[1], 0, h_sam)
                                 .view(1, seq_h_int, 1, -1)
                                 .expand(seq_f_int, seq_h_int, seq_w_int, -1),
-                                freqs_split[2][w_sam]
+                                torch.index_select(freqs_split[2], 0, w_sam)
                                 .view(1, 1, seq_w_int, -1)
                                 .expand(seq_f_int, seq_h_int, seq_w_int, -1),
                             ],
@@ -503,14 +538,18 @@ class RotaryEmbeddingS2VGrid(torch.nn.Module):
                         h_sam = torch.linspace(int(h_o), int(t_h + h_o) - 1, seq_h_int, device=device).long()
                         w_sam = torch.linspace(int(w_o), int(t_w + w_o) - 1, seq_w_int, device=device).long()
 
-                        freqs_0 = freqs[0][f_sam] if f_o >= 0 else freqs[0][f_sam].conj()
+                        freqs_0 = torch.index_select(freqs[0] if f_o >= 0 else freqs[0].conj(), 0, f_sam)
                         freqs_0 = freqs_0.view(seq_f_int, 1, 1, -1)
 
                         freqs_i = torch.cat(
                             [
                                 freqs_0.expand(seq_f_int, seq_h_int, seq_w_int, -1),
-                                freqs[1][h_sam].view(1, seq_h_int, 1, -1).expand(seq_f_int, seq_h_int, seq_w_int, -1),
-                                freqs[2][w_sam].view(1, 1, seq_w_int, -1).expand(seq_f_int, seq_h_int, seq_w_int, -1),
+                                torch.index_select(freqs[1], 0, h_sam)
+                                .view(1, seq_h_int, 1, -1)
+                                .expand(seq_f_int, seq_h_int, seq_w_int, -1),
+                                torch.index_select(freqs[2], 0, w_sam)
+                                .view(1, 1, seq_w_int, -1)
+                                .expand(seq_f_int, seq_h_int, seq_w_int, -1),
                             ],
                             dim=-1,
                         ).reshape(seg_len, 1, -1)

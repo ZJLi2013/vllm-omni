@@ -1,31 +1,64 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """MiniMax H3 remote-code VAE adapters and exact latent contracts."""
 
 from __future__ import annotations
 
 import importlib
 import json
-from contextlib import AbstractContextManager
+from collections.abc import Iterator
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 from PIL import Image
 from transformers.dynamic_module_utils import get_class_from_dynamic_module
+from vllm.logger import init_logger
 
 from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import (
     DistributedVaeMixin,
 )
-from vllm_omni.diffusion.distributed.parallel_state import get_dit_group
-from vllm_omni.diffusion.offloader.module_residency import PinnedModuleStager
+from vllm_omni.diffusion.distributed.parallel_state import get_world_group
+from vllm_omni.diffusion.models.interface import DecodedChunkConsumer
+from vllm_omni.diffusion.offloader.module_residency import (
+    BoundedAllocatorCache,
+    PinnedModuleStager,
+)
 
+from .chunked_decode import decode_h3_chunks
+from .ops import install_h3_vae_optimizations
 from .packed_tokens import minimax_h3_patchify_video_latent
 
 MINIMAX_H3_KEYFRAME_ENCODE_SEED = 42
 MINIMAX_H3_AUDIO_SAMPLE_RATE = 32000
 MINIMAX_H3_AUDIO_CHANNELS = 2
+
+
+logger = init_logger(__name__)
+
+
+@contextmanager
+def _minimax_h3_keyframe_encode_context(
+    device: torch.device,
+) -> Iterator[None]:
+    if device.type != "cuda":
+        yield
+        return
+
+    # The official keyframe latent uses cuDNN's TF32 convolution path. The
+    # default non-deterministic algorithm can select numerically different
+    # reductions on H100s, and the difference is amplified by the denoiser.
+    # Pin both the algorithm and math mode for this sensitive encode only.
+    with torch.backends.cudnn.flags(
+        enabled=True,
+        benchmark=False,
+        deterministic=True,
+        allow_tf32=True,
+    ):
+        yield
 
 
 def _load_component_config(component_path: str) -> dict[str, Any]:
@@ -51,7 +84,14 @@ def _load_remote_component(
         class_reference,
         component_path,
     )
-    return component_cls.from_pretrained(component_path)
+    # Build on the host regardless of the ambient default device. Online
+    # quantization wraps pipeline construction in a `with torch.device(<accel>)`
+    # block for the DiT's quantized linears, and the checkpoint's own VAE code
+    # builds constants with ops that have no accelerator kernel (BigVGAN's
+    # anti-aliasing filters call torch.kaiser_window). Callers place the module
+    # explicitly right after this returns, so nothing depends on the context.
+    with torch.device("cpu"):
+        return component_cls.from_pretrained(component_path)
 
 
 class _AudioVAEDeterminismContext(AbstractContextManager):
@@ -112,11 +152,18 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             component_path,
             self.config_dict,
         )
-        # Match the reference loader contract: video VAE weights stay FP32.
-        # Keyframe encoding is numerically sensitive to first casting the
-        # checkpoint through FP16; decode still runs under FP16 autocast.
+        # Match the reference loader contract before installing inference-only
+        # decoder fast paths. Keyframe encoding remains FP32; decoder Linear
+        # weights may be materialized in FP16 because reference decode casts
+        # those same tensors through CUDA autocast on every tile.
         initial_device = load_device or device
         self.remote.eval().to(device=initial_device, dtype=torch.float32)
+        decoder = getattr(self.remote.model, "decoder", None)
+        if decoder is not None:
+            install_h3_vae_optimizations(
+                decoder,
+                device=device,
+            )
         self._stager = None
         if initial_device.type == "cpu" and device.type not in ("cpu", "meta"):
             self._stager = PinnedModuleStager(
@@ -136,12 +183,21 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         else:
             self.remote.to(self._device_target)
 
+    def set_omni_component_cache(self, cache: BoundedAllocatorCache | None) -> None:
+        self._omni_component_cache = cache
+        if self._stager is not None:
+            self._stager.set_cache_retention(cache)
+
     def offload_to_cpu(self) -> None:
         if self._stager is not None:
             self._stager.offload()
         else:
             self.remote.to("cpu")
-            torch.accelerator.empty_cache()
+            cache = getattr(self, "_omni_component_cache", None)
+            if cache is None:
+                torch.accelerator.empty_cache()
+            else:
+                cache.release_if_needed()
 
     def set_parallel_size(
         self,
@@ -150,7 +206,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
     ) -> None:
         if mode != "tile":
             raise ValueError(f"MiniMax H3 VAE supports its native tile parallel mode only, got {mode!r}")
-        group = get_dit_group()
+        group = get_world_group().device_group
         world_size = dist.get_world_size(group)
         rank = dist.get_rank(group)
         parallel_size = int(parallel_size)
@@ -163,9 +219,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         self.parallel_size = parallel_size
         enabled = parallel_size > 1
 
-        package = self.remote.__class__.__module__.rsplit(".", 1)[0]
-        parallel_module = importlib.import_module(f"{package}.parallel")
-        state = parallel_module.get_parallel_state()
+        state = self._native_parallel_state()
         state.clear()
         state.update(
             group_size=parallel_size,
@@ -180,6 +234,57 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         )
         self.model.parallel_tiling = enabled
 
+    def _native_parallel_state(self) -> dict[str, Any]:
+        """Return the checkpoint's own mutable parallel-state dict."""
+
+        package = self.remote.__class__.__module__.rsplit(".", 1)[0]
+        parallel_module = importlib.import_module(f"{package}.parallel")
+        return parallel_module.get_parallel_state()
+
+    def _decoder_tile_count(self, latent: torch.Tensor) -> int:
+        """Number of decoder tiles the checkpoint will split ``latent`` into.
+
+        Mirrors the checkpoint's ``decode_tiled``: the grid is computed from the
+        pixel-space dimensions, so it is a pure function of the latent shape and
+        resolves identically on every rank.
+        """
+
+        ratio = int(self.model.vae_ratio)
+        rows, _, _ = self.model.split_tiles(int(latent.shape[-2]) * ratio, True)
+        cols, _, _ = self.model.split_tiles(int(latent.shape[-1]) * ratio, True)
+        return len(rows) * len(cols)
+
+    @contextmanager
+    def _rank_local_tiling(self) -> Iterator[None]:
+        """Run one decode with tiling kept on this rank, then restore the group.
+
+        Used only when there are fewer tiles than ranks. Every rank then decodes
+        every tile, which is slower than sharing the work but is correct and
+        involves no collective.
+        """
+
+        state = self._native_parallel_state()
+        saved_state = dict(state)
+        saved_tiling = self.model.parallel_tiling
+        state.update(
+            group_size=1,
+            group_rank=0,
+            local_process_group=None,
+            sp_size=1,
+            sp_rank=0,
+            sp_enabled=False,
+            sp_process_group=None,
+            tp_size=1,
+            tp_rank=0,
+        )
+        self.model.parallel_tiling = False
+        try:
+            yield
+        finally:
+            state.clear()
+            state.update(saved_state)
+            self.model.parallel_tiling = saved_tiling
+
     def is_distributed_enabled(self) -> bool:
         return self.parallel_size > 1 and dist.is_initialized()
 
@@ -193,15 +298,16 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             self.to(torch.float32)
         devices = [parameter.device] if parameter.device.type != "cpu" else []
         try:
-            with torch.random.fork_rng(devices=devices):
+            with torch.random.fork_rng(devices=devices, device_type=parameter.device.type):
                 torch.default_generator.manual_seed(MINIMAX_H3_KEYFRAME_ENCODE_SEED)
                 for device in devices:
                     with self.device_module.device(device):
                         self.device_module.manual_seed(MINIMAX_H3_KEYFRAME_ENCODE_SEED)
-                latent = self.model.encode_images(
-                    image,
-                    use_fp16_latent=True,
-                )[0]
+                with _minimax_h3_keyframe_encode_context(parameter.device):
+                    latent = self.model.encode_images(
+                        image,
+                        use_fp16_latent=True,
+                    )[0]
         finally:
             self.model.parallel_tiling = previous_parallel
             if previous_dtype != torch.float32:
@@ -237,7 +343,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             self.to(torch.float32)
         devices = [parameter.device] if parameter.device.type != "cpu" else []
         try:
-            with torch.random.fork_rng(devices=devices):
+            with torch.random.fork_rng(devices=devices, device_type=parameter.device.type):
                 torch.default_generator.manual_seed(MINIMAX_H3_KEYFRAME_ENCODE_SEED)
                 for device in devices:
                     with self.device_module.device(device):
@@ -273,26 +379,82 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         ).float()
         return rows, shape
 
+    def _decode_tiling_context(self, latent: torch.Tensor) -> AbstractContextManager:
+        """Pick the tiling mode a decode of ``latent`` can safely use.
+
+        The checkpoint hands rank r the tiles ``range(r, num_tiles, sp_size)``
+        and then rejects an empty share inside the gather. A rank with no
+        tiles raises and leaves the collective while the others block in it
+        forever, so too few tiles hangs the whole stage rather than failing
+        it. Tile count depends only on the latent shape, so every rank takes
+        this branch together.
+        """
+        num_tiles = self._decoder_tile_count(latent)
+        if self.parallel_size > 1 and num_tiles < self.parallel_size:
+            logger.warning_once(
+                "MiniMax-H3 VAE decode splits into %d tile(s) but the tile group has "
+                "%d ranks; decoding rank-locally for this shape instead, which is "
+                "slower but avoids ranks without tiles hanging the collective.",
+                num_tiles,
+                self.parallel_size,
+            )
+            return self._rank_local_tiling()
+        return nullcontext()
+
     @torch.inference_mode()
     def decode_latent(self, latent: torch.Tensor) -> torch.Tensor:
+        with self._decode_tiling_context(latent):
+            decoded = self.model.decode_base(self._denormalize_latent(latent))
+        return self._normalize_decoded_frames(self.model.processor.revert_tensor(decoded))
+
+    def _denormalize_latent(self, latent: torch.Tensor) -> torch.Tensor:
         channels = int(self.config_dict["latent_channels"])
-        mean = torch.tensor(
-            self.config_dict["latents_mean"],
-            device=latent.device,
-            dtype=latent.dtype,
-        ).view(1, channels, 1, 1, 1)
-        std = torch.tensor(
-            self.config_dict["latents_std"],
-            device=latent.device,
-            dtype=latent.dtype,
-        ).view(1, channels, 1, 1, 1)
-        decoded = self.model.decode_base(latent * std + mean)
-        frames = self.model.processor.revert_tensor(decoded)
+        mean = torch.tensor(self.config_dict["latents_mean"], device=latent.device, dtype=latent.dtype)
+        std = torch.tensor(self.config_dict["latents_std"], device=latent.device, dtype=latent.dtype)
+        shape = (1, channels, 1, 1, 1)
+        return latent * std.view(shape) + mean.view(shape)
+
+    @staticmethod
+    def _normalize_decoded_frames(decoded: torch.Tensor) -> torch.Tensor:
+        """Canonicalize remote H3 decoder output to [B,C,T,H,W]."""
+        frames = decoded
         if frames.ndim == 4:
             frames = frames.unsqueeze(0).transpose(1, 2)
         if frames.ndim != 5:
             raise ValueError(f"unexpected decoded video shape {tuple(frames.shape)}")
         return frames.float()
+
+    # Chunks are reverted through the checkpoint's processor, which
+    # denormalizes and clamps into the unit interval.
+    chunk_value_range: ClassVar[tuple[float, float]] = (0.0, 1.0)
+
+    @torch.inference_mode()
+    def decode_with_chunks(self, z: torch.Tensor, *, on_chunk: DecodedChunkConsumer) -> None:
+        """Decode temporal clips and synchronously publish frames-only chunks.
+
+        Implements :class:`SupportsChunkedVAEDecode`. Every rank participating
+        in distributed VAE execution must invoke this method with a callback so
+        the temporal collectives stay in lockstep; ``on_chunk`` is called only
+        on the rank that owns output. Chunks arrive as ``[B, C, T, H, W]``
+        float frames, normalized through the checkpoint's processor to match
+        the complete decode path. After a callback failure, the remaining
+        chunks are decoded and discarded before the exception is re-raised.
+        """
+        if not callable(on_chunk):
+            raise TypeError("on_chunk must be callable")
+        if not callable(getattr(self.model, "_adaptive_decode", None)):
+            raise RuntimeError("Loaded MiniMax-H3 VAE does not expose temporal decode primitives")
+        group = None
+        if self.is_distributed_enabled():
+            group = self._native_parallel_state().get("sp_process_group")
+            if group is None or dist.get_world_size(group) != self.parallel_size:
+                raise RuntimeError("MiniMax-H3 VAE chunk decode has an invalid spatial-parallel group")
+        # Native H3 tiling performs its own collectives for every temporal clip,
+        # so this path needs the same too-few-tiles fallback as the complete
+        # decode: without it a shape that leaves some ranks tileless hangs the
+        # gather instead of decoding rank-locally.
+        with self._decode_tiling_context(z):
+            decode_h3_chunks(self, z, on_chunk, group=group)
 
 
 class MiniMaxH3AudioVAE(nn.Module):
@@ -330,12 +492,21 @@ class MiniMaxH3AudioVAE(nn.Module):
         else:
             self.remote.to(self._device_target)
 
+    def set_omni_component_cache(self, cache: BoundedAllocatorCache | None) -> None:
+        self._omni_component_cache = cache
+        if self._stager is not None:
+            self._stager.set_cache_retention(cache)
+
     def offload_to_cpu(self) -> None:
         if self._stager is not None:
             self._stager.offload()
         else:
             self.remote.to("cpu")
-            torch.accelerator.empty_cache()
+            cache = getattr(self, "_omni_component_cache", None)
+            if cache is None:
+                torch.accelerator.empty_cache()
+            else:
+                cache.release_if_needed()
 
     @torch.inference_mode()
     def encode_waveform(

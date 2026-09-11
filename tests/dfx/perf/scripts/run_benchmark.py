@@ -1,4 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import json
+import math
 import os
 import threading
 from collections.abc import Callable
@@ -157,8 +161,49 @@ def benchmark_params(request):
     }
 
 
-def assert_result(result, num_prompt) -> None:
+def _resolve_num_warmups(params: dict[str, Any], *, default: int) -> int:
+    value = params.get("num_warmups")
+    if value is None:
+        return default
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ValueError("num_warmups must be a non-negative integer")
+    return value
+
+
+def assert_result(result, params, num_prompt) -> None:
     assert result["completed"] == num_prompt, "Request failures exist"
+    if params.get("dataset_name") == "omniinteract":
+        summary = result.get("omniinteract")
+        assert isinstance(summary, dict), "OmniInteract summary is missing"
+        assert (summary.get("total"), summary.get("success"), summary.get("failed")) == (
+            num_prompt,
+            num_prompt,
+            0,
+        ), "OmniInteract requests did not all succeed"
+        assert summary.get("artifacts_complete") is True, "OmniInteract artifacts are incomplete"
+    baseline = params.get("baseline")
+    hardware = result.get("Hardware")
+    hardware_baseline = baseline.get(hardware) if isinstance(baseline, dict) and isinstance(hardware, str) else None
+    if isinstance(hardware_baseline, dict) and "mean_tpot_ms" in hardware_baseline:
+        num_tpot_samples = result.get("num_tpot_samples")
+        mean_tpot_ms = result.get("mean_tpot_ms")
+        assert isinstance(num_tpot_samples, int) and not isinstance(num_tpot_samples, bool) and num_tpot_samples > 0, (
+            "TPOT baseline is configured, but no measurable TPOT samples were produced"
+        )
+        assert (
+            isinstance(mean_tpot_ms, int | float) and not isinstance(mean_tpot_ms, bool) and math.isfinite(mean_tpot_ms)
+        ), "TPOT baseline is configured, but mean_tpot_ms is not finite"
+    expected_audio_turns = params.get("expected_duplex_audio_turns_per_session")
+    if expected_audio_turns is not None:
+        session_metrics = result.get("duplex_session_metrics")
+        assert isinstance(session_metrics, list), "Duplex session metrics are missing"
+        assert len(session_metrics) == num_prompt, (
+            f"Expected {num_prompt} duplex session metric rows, got {len(session_metrics)}"
+        )
+        assert all(
+            isinstance(metric, dict) and metric.get("audio_turn_count") == expected_audio_turns
+            for metric in session_metrics
+        ), f"Not every duplex session emitted {expected_audio_turns} audio turns"
 
 
 @pytest.mark.benchmark
@@ -208,10 +253,12 @@ def test_performance_benchmark(omni_server, benchmark_params):
         "baseline",
         "num_prompts",
         "max_concurrency",
+        "num_warmups",
         "task",
         "enabled",
         "eval_phase",
         "trust_remote_code",
+        "expected_duplex_audio_turns_per_session",
     }
 
     for key, value in params.items():
@@ -237,7 +284,7 @@ def test_performance_benchmark(omni_server, benchmark_params):
         break
 
     # QPS / request-rate sweep
-    for qps, num_prompt in zip(qps_list, num_prompt_list):
+    for sweep_index, (qps, num_prompt) in enumerate(zip(qps_list, num_prompt_list)):
         args = args + ["--request-rate", str(qps), "--num-prompts", str(num_prompt)]
         result = run_benchmark(
             args=args,
@@ -246,14 +293,16 @@ def test_performance_benchmark(omni_server, benchmark_params):
             dataset_name=dataset_name,
             num_prompt=num_prompt,
             baseline_config=params.get("baseline"),
+            sweep_index=sweep_index,
             random_input_len=params.get("random_input_len"),
             random_output_len=params.get("random_output_len"),
             resource_label=resource_label,
+            num_warmups=_resolve_num_warmups(params, default=2),
         )
-        assert_result(result, num_prompt)
+        assert_result(result, params, num_prompt)
 
     # concurrency test
-    for concurrency, num_prompt in zip(max_concurrency_list, num_prompt_list):
+    for sweep_index, (concurrency, num_prompt) in enumerate(zip(max_concurrency_list, num_prompt_list)):
         args = args + ["--max-concurrency", str(concurrency), "--num-prompts", str(num_prompt), "--request-rate", "inf"]
         result = run_benchmark(
             args=args,
@@ -262,8 +311,10 @@ def test_performance_benchmark(omni_server, benchmark_params):
             dataset_name=dataset_name,
             num_prompt=num_prompt,
             baseline_config=params.get("baseline"),
+            sweep_index=sweep_index,
             random_input_len=params.get("random_input_len"),
             random_output_len=params.get("random_output_len"),
             resource_label=resource_label,
+            num_warmups=_resolve_num_warmups(params, default=max(2, int(concurrency))),
         )
-        assert_result(result, num_prompt)
+        assert_result(result, params, num_prompt)

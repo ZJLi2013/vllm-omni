@@ -121,34 +121,6 @@ def rope_apply(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
     return torch.stack((x_re * cos - x_im * sin, x_re * sin + x_im * cos), dim=-1).flatten(3)
 
 
-def rope_action_apply(
-    x: torch.Tensor,
-    freqs: torch.Tensor,
-    freqs_action: torch.Tensor,
-    freqs_state: torch.Tensor,
-    action_register_length: int | None,
-    num_action_per_block: int = 32,
-    num_state_per_block: int = 1,
-) -> torch.Tensor:
-    """RoPE with action/state frequency tables for multi-step sequences."""
-    B, seq_len, n, _ = x.shape
-    x = torch.view_as_complex(x.to(torch.float32).reshape(B, seq_len, n, -1, 2))
-    if action_register_length is not None:
-        if num_action_per_block is None:
-            raise ValueError("num_action_per_block is required when action_register_length is set.")
-        if num_state_per_block is None:
-            raise ValueError("num_state_per_block is required when action_register_length is set.")
-        chunk_size = action_register_length // (num_action_per_block + num_state_per_block)
-        freqs_1d_action = freqs_action[: chunk_size * num_action_per_block].view(
-            chunk_size * num_action_per_block, 1, -1
-        )
-        freqs_1d_state = freqs_state[: chunk_size * num_state_per_block].view(chunk_size * num_state_per_block, 1, -1)
-        freqs = torch.cat([freqs, freqs_1d_action, freqs_1d_state], dim=0)
-    freqs = freqs.unsqueeze(0)
-    x = torch.view_as_real(x * freqs).flatten(3)
-    return x
-
-
 def causal_rope_action_freqs(
     freqs: torch.Tensor,
     freqs_action: torch.Tensor,

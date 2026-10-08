@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Stage-1 Code2Wav model for PersonaPlex (Moshi finetune).
 
 This is the ``LLM_GENERATION`` codec stage of the 2-stage PersonaPlex pipeline.
@@ -23,7 +23,7 @@ Layout contract (mirrors ``Qwen3TTSCode2Wav``):
 The Mimi decoder is the transformers ``MimiModel`` (kyutai/mimi weights), not
 in vLLM's safetensors loader, so they are loaded eagerly in ``load_weights``
 part of the vLLM weights iterator (the codec owns its own checkpoint; see the
-experimental fullduplex package for the same pattern).
+``duplex`` subpackage of this model folder for the same pattern).
 """
 
 from __future__ import annotations
@@ -406,6 +406,28 @@ class PersonaPlexCode2Wav(nn.Module):
             ).eval()
             for _ in range(self._max_codec_sessions)
         ]
+        if getattr(self.config, "mimi_cuda_graphs", False):
+            # Each decoder is leased per request and reset in place, so its B=1
+            # graphs stay valid. Deltas arrive as the first single frame and then
+            # full chunks, so those two frame counts are recorded; other counts
+            # run eagerly. The graphs replay one at a time on this stage's stream
+            # and copy their output, so they share one pool.
+            pool = torch.cuda.graph_pool_handle() if torch.device(str(device)).type == "cuda" else None
+            captured = 0
+            for codec in codecs:
+                codec.streaming_init(1)
+                captured += bool(
+                    codec.capture_cuda_graphs(
+                        encode=False,
+                        decode_frame_counts=(1, _MIMI_DECODE_BATCH_FRAMES),
+                        pool=pool,
+                    )
+                )
+            logger.info(
+                "PersonaPlex Code2Wav replays Mimi decode from CUDA graphs on %d/%d stream(s)",
+                captured,
+                len(codecs),
+            )
         self._set_mimi_codecs(codecs)
         self._mimi_device = torch.device(str(device))
         reported_sr = getattr(codecs[0].model.config, "sampling_rate", None)

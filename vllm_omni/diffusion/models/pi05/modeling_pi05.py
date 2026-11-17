@@ -32,6 +32,7 @@ Reference implementations:
 
 from __future__ import annotations
 
+import functools
 import logging
 import math
 from collections.abc import Iterable
@@ -822,6 +823,8 @@ class _Tiles:
     block_k: int
     num_warps: int = 4
     num_stages: int = 3
+    # ``(block_k, block_n)`` right-hand ``tl.dot`` tiles loaded per K step.
+    rhs_tiles: int = 1
 
 
 # In the action expert, GEMMs run in Triton, with their epilogues fused in, only
@@ -839,11 +842,11 @@ _TRITON_GEMM_DTYPES = (torch.bfloat16,)
 _TILES: dict[tuple[str, torch.dtype], _Tiles] = {
     # (kernel, dtype): tiles. ``block_n`` is the RoPE half-tile for ``qkv`` and
     # the head-dim tile for ``values``.
-    ("qkv", torch.bfloat16): _Tiles(64, 16, 128),
+    ("qkv", torch.bfloat16): _Tiles(64, 16, 128, rhs_tiles=2),
     ("scores", torch.bfloat16): _Tiles(32, 32, 128, num_warps=8),
     ("values", torch.bfloat16): _Tiles(16, 64, 64, num_warps=8),
     ("linear", torch.bfloat16): _Tiles(32, 32, 256, num_stages=4),
-    ("gelu_linear", torch.bfloat16): _Tiles(64, 32, 64),
+    ("gelu_linear", torch.bfloat16): _Tiles(64, 32, 64, rhs_tiles=2),
 }
 # The elementwise epilogues that follow a cuBLAS GEMM: rows × columns.
 _EPILOGUE_TILES = _Tiles(32, 64, 0)
@@ -855,6 +858,25 @@ def _triton_gemms(dtype: torch.dtype) -> bool:
 
 def _tiles(kernel: str, dtype: torch.dtype) -> _Tiles:
     return _TILES[(kernel, dtype)] if _triton_gemms(dtype) else _EPILOGUE_TILES
+
+
+@functools.cache
+def _max_shared_mem(device_index: int) -> int:
+    return triton.runtime.driver.active.utils.get_device_properties(device_index)["max_shared_mem"]
+
+
+def _num_stages(tiles: _Tiles, dtype: torch.dtype, device: torch.device) -> int:
+    """``tiles.num_stages``, lowered until the GEMM's operand buffers fit the device's shared memory.
+
+    Triton's pipeliner keeps ``num_stages - 1`` K steps of operand tiles in
+    shared memory: the ``linear`` tiles need 96 KB at 4 stages, over the 64 KB
+    of AMD CDNA3 (gfx942). The K order, and so the result, does not depend on
+    the stage count.
+    """
+    if not tiles.block_k:
+        return tiles.num_stages
+    stage_bytes = (tiles.block_m + tiles.rhs_tiles * tiles.block_n) * tiles.block_k * dtype.itemsize
+    return min(tiles.num_stages, 1 + _max_shared_mem(device.index) // stage_bytes)
 
 
 def _fused_rms_norm(
@@ -941,7 +963,7 @@ def _fused_qkv_rope(
         BLOCK_H=tiles.block_n,
         BLOCK_K=tiles.block_k,
         num_warps=tiles.num_warps,
-        num_stages=tiles.num_stages,
+        num_stages=_num_stages(tiles, dtype, x.device),
         enable_fp_fusion=False,
     )
 
@@ -983,7 +1005,7 @@ def _fused_attention(
             BLOCK_N=tiles.block_n,
             BLOCK_K=tiles.block_k,
             num_warps=tiles.num_warps,
-            num_stages=tiles.num_stages,
+            num_stages=_num_stages(tiles, dtype, q.device),
             enable_fp_fusion=False,
         )
     else:
@@ -1020,7 +1042,7 @@ def _fused_attention(
             BLOCK_D=tiles.block_n,
             BLOCK_K=tiles.block_k,
             num_warps=tiles.num_warps,
-            num_stages=tiles.num_stages,
+            num_stages=_num_stages(tiles, dtype, q.device),
             enable_fp_fusion=False,
         )
     else:
@@ -1063,7 +1085,7 @@ def _fused_linear_residual(
         BLOCK_N=tiles.block_n,
         BLOCK_K=tiles.block_k,
         num_warps=tiles.num_warps,
-        num_stages=tiles.num_stages,
+        num_stages=_num_stages(tiles, dtype, x.device),
         enable_fp_fusion=False,
     )
 
@@ -1101,7 +1123,7 @@ def _fused_linear_gelu_mul(x: torch.Tensor, mlp: nn.Module, out: torch.Tensor) -
         BLOCK_N=tiles.block_n,
         BLOCK_K=tiles.block_k,
         num_warps=tiles.num_warps,
-        num_stages=tiles.num_stages,
+        num_stages=_num_stages(tiles, dtype, x.device),
         enable_fp_fusion=False,
     )
 
